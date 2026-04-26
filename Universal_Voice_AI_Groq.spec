@@ -1,20 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
-import customtkinter
 
-# customtkinterのパスを取得
-ctk_path = os.path.dirname(customtkinter.__file__)
+ctk_path = r'C:\Users\PHARMY\AppData\Local\Programs\Python\Python312\Lib\site-packages\customtkinter'
+webrtcvad_py = r'C:\Users\PHARMY\AppData\Local\Programs\Python\Python312\Lib\site-packages\webrtcvad.py'
+webrtcvad_pyd = r'C:\Users\PHARMY\AppData\Local\Programs\Python\Python312\Lib\site-packages\_webrtcvad.cp312-win_amd64.pyd'
 
 a = Analysis(
     ['main.py'],
     pathex=[],
-    binaries=[],
-    datas=[(ctk_path, 'customtkinter')],
-    hiddenimports=['pystray', 'PIL', 'numpy', 'webrtcvad', 'pygetwindow', 'pywin32'],
+    binaries=[(webrtcvad_pyd, '.')],
+    datas=[(ctk_path, 'customtkinter'), (webrtcvad_py, '.')],
+    hiddenimports=['pystray', 'PIL', 'numpy', 'pygetwindow', 'pywin32'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['webrtcvad'], # フックエラーを避けるために除外
     noarchive=False,
     optimize=0,
 )
@@ -39,5 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None, # アイコンがあれば追加可能
+    icon=None,
 )
