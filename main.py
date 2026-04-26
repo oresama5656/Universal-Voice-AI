@@ -10,6 +10,11 @@ import pyaudio
 import pyautogui
 from pynput import keyboard
 from groq import Groq
+import webrtcvad
+import collections
+import pystray
+from pystray import MenuItem as item
+from PIL import Image, ImageDraw
 
 # --- 設定 ---
 CONFIG_FILE = "config_groq.json"
@@ -37,9 +42,8 @@ def save_config(config):
         json.dump(config, f, indent=4, ensure_ascii=False)
 
 # --- UI設定項目 ---
-# 高級感を演出するためのカラーパレット
 COLOR_BG = "#1A1A1B"            # 深いチャコールブラック
-COLOR_ACCENT = "#D4AF37"        # メタリックゴールド (高級感の演出)
+COLOR_ACCENT = "#D4AF37"        # メタリックゴールド
 COLOR_TEXT_PRIMARY = "#E0E0E0"  # メインテキスト
 COLOR_TEXT_SECONDARY = "#888888" # サブテキスト
 COLOR_RECORDING = "#FF4B4B"     # 録音中のアクセント
@@ -74,88 +78,136 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         # ウィンドウ設定
         self.title("Universal Voice AI")
         self.attributes("-topmost", True)
-        self.attributes("-alpha", 0.9)  # 高級感を出すため、不透明度を少し上げる
+        self.attributes("-alpha", 0.9)
         self.overrideredirect(True)
         
-        # ctk の外観設定
         ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("blue")
         
         # ウィンドウサイズと位置
-        width, height = 240, 100
+        width, height = 260, 140
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{width}x{height}+{sw-width-30}+{sh-height-100}")
         self.configure(fg_color=COLOR_BG)
         
         self.recording = False
-        self.audio_buffer = []
+        self.audio_buffer = []  # 現在のチャンクの音声
         self.buffer_lock = threading.Lock()
-        self.full_transcript = ""
         
-        # PyAudio設定
+        # テキストステート分離 (要件1)
+        self.finalized_transcript = ""  # 確定済み
+        self.partial_transcript = ""    # 認識中
+        
+        # VAD設定 (要件2)
+        self.vad = webrtcvad.Vad(3)     # 0-3 (3は最高感度)
+        self.sample_rate = 16000
+        self.frame_duration_ms = 30     # 10, 20, 30ms のみ対応
+        self.frame_size = int(self.sample_rate * self.frame_duration_ms / 1000) * 2 # 16bit = 2bytes
+        
         self.pa = pyaudio.PyAudio()
         self.stream = None
         
-        # メインフレーム (角丸を活かす)
+        # システムトレイ設定
+        self.tray_icon = None
+        self.setup_tray()
+        
+        # UI構築
         self.main_frame = ctk.CTkFrame(self, fg_color=COLOR_BG, corner_radius=15, border_width=1, border_color="#333333")
         self.main_frame.pack(expand=True, fill="both", padx=2, pady=2)
         
-        # ステータスラベル (上部)
         self.status_label = ctk.CTkLabel(
             self.main_frame, text=f"READY ({self.config['hotkey'].upper()})", 
             text_color=COLOR_ACCENT, font=("Montserrat", 10, "bold")
         )
-        self.status_label.pack(pady=(12, 0))
+        self.status_label.pack(pady=(8, 2))
         
-        # プレビュー領域 (中央)
-        self.preview_label = ctk.CTkLabel(
-            self.main_frame, text="Wait for command...", 
-            text_color=COLOR_TEXT_SECONDARY, font=("Meiryo", 8),
-            wraplength=200, height=35
+        # プレビュー表示 (要件1: スクロール可能なTextboxへ変更)
+        self.preview_box = ctk.CTkTextbox(
+            self.main_frame, fg_color="transparent", text_color=COLOR_TEXT_SECONDARY,
+            font=("Meiryo", 9), height=65, wrap="char", border_width=0
         )
-        self.preview_label.pack(pady=(2, 5), padx=15)
+        self.preview_box.pack(fill="both", padx=15, pady=2)
+        self.preview_box.insert("1.0", "Wait for command...")
+        self.preview_box.configure(state="disabled")
         
-        # 音声メーター (下部)
-        self.meter_frame = ctk.CTkFrame(self.main_frame, height=4, fg_color="#2A2A2A", corner_radius=2)
-        self.meter_frame.pack(fill="x", padx=20, pady=(0, 10))
-        
-        self.meter_bar = ctk.CTkFrame(self.meter_frame, height=4, width=0, fg_color=COLOR_ACCENT, corner_radius=2)
+        # 音声メーター
+        self.meter_frame = ctk.CTkFrame(self.main_frame, height=3, fg_color="#2A2A2A", corner_radius=1)
+        self.meter_frame.pack(fill="x", padx=20, pady=(4, 8))
+        self.meter_bar = ctk.CTkFrame(self.meter_frame, height=3, width=0, fg_color=COLOR_ACCENT, corner_radius=1)
         self.meter_bar.place(x=0, y=0)
         
-        # キーボードリスナー
+        # コントロールボタン (最小化・終了)
+        self.control_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.control_frame.place(relx=1.0, rely=0.0, anchor="ne", x=-10, y=10)
+        
+        self.min_button = ctk.CTkButton(
+            self.control_frame, text="−", width=20, height=20, corner_radius=10,
+            fg_color="transparent", hover_color="#3A3A3A", text_color=COLOR_TEXT_SECONDARY,
+            font=("Montserrat", 14, "bold"), command=self.minimize_app
+        )
+        self.min_button.pack(side="left", padx=2)
+        
+        self.close_button = ctk.CTkButton(
+            self.control_frame, text="×", width=20, height=20, corner_radius=10,
+            fg_color="transparent", hover_color=COLOR_RECORDING, text_color=COLOR_TEXT_SECONDARY,
+            font=("Montserrat", 14, "bold"), command=self.quit_app
+        )
+        self.close_button.pack(side="left", padx=2)
+        
+        # リスナーとバインド
         self.listener = keyboard.Listener(on_press=self.on_press)
         self.listener.daemon = True
         self.listener.start()
-
-        # ドラッグ移動のバインド
-        self.main_frame.bind("<B1-Motion>", self.on_drag)
-        self.status_label.bind("<B1-Motion>", self.on_drag)
         
-        # 右クリックで設定を開く
-        self.main_frame.bind("<Button-3>", self.show_settings)
-        self.status_label.bind("<Button-3>", self.show_settings)
-        self.preview_label.bind("<Button-3>", self.show_settings)
-
-    def apply_gain(self, audio_data, gain):
-        """16bit PCMデータにゲインを適用する"""
-        if gain == 1.0:
-            return audio_data
-        import numpy as np
-        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
-        audio_np = audio_np * gain
-        # クリッピング防止
-        audio_np = np.clip(audio_np, -32768, 32767)
-        return audio_np.astype(np.int16).tobytes()
+        for item in [self.main_frame, self.status_label]:
+            item.bind("<B1-Motion>", self.on_drag)
+            item.bind("<Button-3>", self.show_settings)
 
     def on_drag(self, event):
-        x, y = self.winfo_x() + event.x - 120, self.winfo_y() + event.y - 50
+        x, y = self.winfo_x() + event.x - 130, self.winfo_y() + event.y - 70
         self.geometry(f"+{x}+{y}")
+
+    def setup_tray(self):
+        """システムトレイアイコンのセットアップ"""
+        # アイコン画像の作成 (シンプルな金色の円)
+        width, height = 64, 64
+        image = Image.new('RGB', (width, height), COLOR_BG)
+        dc = ImageDraw.Draw(image)
+        dc.ellipse([8, 8, 56, 56], fill=COLOR_ACCENT)
+        
+        menu = (
+            item('表示', self.restore_app),
+            item('設定', lambda: self.after(0, lambda: self.show_settings(None))),
+            item('終了', self.quit_app)
+        )
+        self.tray_icon = pystray.Icon("universal_voice_ai", image, "Universal Voice AI", menu)
+        # トレイアイコンを別スレッドで実行
+        threading.Thread(target=self.tray_icon.run, daemon=True).start()
+
+    def minimize_app(self):
+        """アプリを非表示にしてトレイに格納"""
+        self.withdraw()
+
+    def restore_app(self, icon=None, item=None):
+        """アプリを再表示"""
+        self.after(0, self.deiconify)
+        self.after(0, lambda: self.attributes("-topmost", True))
+
+    def quit_app(self, icon=None, item=None):
+        """アプリを完全に終了"""
+        if self.tray_icon:
+            self.tray_icon.stop()
+        if self.stream:
+            self.stream.stop_stream()
+            self.stream.close()
+        self.pa.terminate()
+        self.destroy()
+        os._exit(0)
 
     def on_press(self, key):
         try:
             k = key.name if hasattr(key, 'name') else key.char
             if k == self.config.get('hotkey', 'f8'):
-                self.after(0, lambda: self.toggle_recording())
+                self.after(0, self.toggle_recording)
         except: pass
 
     def toggle_recording(self):
@@ -168,7 +220,6 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         if not self.recording:
             self.meter_bar.configure(width=0)
             return
-        
         with self.buffer_lock:
             if self.audio_buffer:
                 latest_data = self.audio_buffer[-1]
@@ -176,171 +227,181 @@ class UniversalVoiceAI_Groq(ctk.CTk):
                 count = len(latest_data) // 2
                 if count > 0:
                     shorts = struct.unpack(f"{count}h", latest_data)
-                    # ゲイン設定を視覚的にも反映させる
                     gain = float(self.config.get("mic_gain", 1.0))
                     sum_squares = sum(((s * gain)/32768.0)**2 for s in shorts)
                     rms = (sum_squares / count)**0.5
-                    # RMSを幅に変換 (0〜180)
-                    w = min(180, int(rms * 1500))
+                    w = min(200, int(rms * 1500))
                     self.meter_bar.configure(width=w)
-        
         self.after(50, self.update_meter)
 
     def start_recording(self):
         if not self.config.get("api_key"):
-            self.status_label.config(text="API KEY\nMISSING!", fg="#FFFF00", bg="#4B0000")
-            messagebox.showwarning("Warning", "Groq APIキーが設定されていません。右クリックで設定を開いてください。")
+            messagebox.showwarning("Warning", "Groq APIキーを設定してください。")
             return
 
         self.recording = True
         self.audio_buffer = []
-        self.full_transcript = ""
+        self.finalized_transcript = ""
+        self.partial_transcript = ""
+        
         self.status_label.configure(text="● RECORDING...", text_color=COLOR_RECORDING)
-        self.preview_label.configure(text="Listening for your voice...", text_color=COLOR_TEXT_PRIMARY)
+        self.update_preview_ui("Listening...", is_initial=True)
         self.meter_bar.configure(fg_color=COLOR_RECORDING)
         self.update_meter()
         
-        # PyAudioストリーム開始 (改善版)
         try:
             self.stream = self.pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=16000,
-                input=True,
-                frames_per_buffer=1024,
+                format=pyaudio.paInt16, channels=1, rate=self.sample_rate,
+                input=True, frames_per_buffer=self.frame_size,
                 stream_callback=self.audio_callback
             )
-            if self.stream:
-                self.stream.start_stream()
+            self.stream.start_stream()
         except Exception as e:
-            print(f"Stream Start Error: {e}")
             self.recording = False
-            self.status_label.configure(text="MIC ERROR", text_color="#FFD700")
-            messagebox.showerror("Microphone Error", f"マイクの初期化に失敗しました。\n\n詳細: {e}")
+            self.status_label.configure(text="MIC ERROR", text_color="#FFFF00")
             return
         
-        # 1.5秒ごとに文字起こしするスレッド
-        threading.Thread(target=self.streaming_loop, daemon=True).start()
+        threading.Thread(target=self.vad_and_stt_loop, daemon=True).start()
 
     def audio_callback(self, in_data, frame_count, time_info, status):
         if not self.recording:
             return (None, pyaudio.paComplete)
         with self.buffer_lock:
-            # ここでゲインを適用
-            gained_data = self.apply_gain(in_data, self.config.get("mic_gain", 1.0))
-            self.audio_buffer.append(gained_data)
+            import numpy as np
+            # ゲイン適用
+            gain = float(self.config.get("mic_gain", 1.0))
+            audio_np = np.frombuffer(in_data, dtype=np.int16).astype(np.float32) * gain
+            audio_np = np.clip(audio_np, -32768, 32767).astype(np.int16)
+            self.audio_buffer.append(audio_np.tobytes())
         return (None, pyaudio.paContinue)
 
-    def streaming_loop(self):
-        try:
-            # 最新SDKに合わせた初期化
-            client = Groq(api_key=self.config["api_key"])
-        except Exception as e:
-            print(f"Groq Client Error: {e}")
-            self.after(0, lambda: self.status_label.configure(text="CLIENT ERROR", text_color="#FF0000"))
-            return
-
+    def vad_and_stt_loop(self):
+        """VADで無音を検知し、APIへ送るメインループ (要件2)"""
+        client = Groq(api_key=self.config["api_key"])
+        
+        # VAD状態管理
+        num_silent_frames = 0
+        silence_threshold = int(1000 / self.frame_duration_ms) # 1.0秒の無音
+        
         while self.recording:
-            time.sleep(1.5) # 1.5秒ごとに処理
+            time.sleep(0.5)
             if not self.recording: break
             
+            # バッファを取り出してVAD判定
             with self.buffer_lock:
                 if not self.audio_buffer: continue
-                frames = list(self.audio_buffer)
+                frames_to_process = list(self.audio_buffer)
+                # API用に全フレームを結合
+                audio_content = b"".join(frames_to_process)
             
-            buffer = io.BytesIO()
-            with wave.open(buffer, 'wb') as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(self.pa.get_sample_size(pyaudio.paInt16))
-                wf.setframerate(16000)
-                wf.writeframes(b''.join(frames))
+            # 最新のフレームで無音判定
+            last_frame = frames_to_process[-1] if frames_to_process else None
+            if last_frame and len(last_frame) == self.frame_size:
+                is_speech = self.vad.is_speech(last_frame, self.sample_rate)
+                if not is_speech:
+                    num_silent_frames += 1
+                else:
+                    num_silent_frames = 0
             
-            buffer.seek(0)
+            # STT実行 (中間または確定)
+            should_finalize = (num_silent_frames >= silence_threshold)
+            self.run_stt(client, audio_content, is_final=should_finalize)
             
-            for attempt in range(3):
-                try:
-                    hallucination_list = [
-                        "ありがとうございました。", "ありがとうございました", "ご視聴ありがとうございました",
-                        "ご視聴ありがとうございました。", "Thank you.", "Thank you for watching.",
-                        "視聴ありがとうございました", "ありがとうございました。"
-                    ]
+            if should_finalize:
+                # 無音を検知したので、音声バッファをリセット
+                with self.buffer_lock:
+                    self.audio_buffer = []
+                num_silent_frames = 0
 
-                    # 小声認識向上のためのプロンプト調整
-                    base_prompt = "これは日本語の音声入力の文字起こしです。言い淀みや無音区間の幻聴を排除してください。"
-                    if self.config.get("mic_gain", 1.0) > 1.5:
-                        base_prompt += " 小さなささやき声も正確に拾い、意味のある文章にしてください。"
+    def run_stt(self, client, audio_data, is_final):
+        """Whisper APIを呼び出し結果をUIに反映"""
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2) # 16bit
+            wf.setframerate(self.sample_rate)
+            wf.writeframes(audio_data)
+        buffer.seek(0)
+        
+        try:
+            base_prompt = "これは日本語の音声入力です。"
+            if self.config.get("mic_gain", 1.0) > 1.5:
+                base_prompt += " 小さなささやき声も正確に拾ってください。"
 
-                    translation = client.audio.transcriptions.create(
-                        file=("audio.wav", buffer),
-                        model=self.config.get("stt_model", "whisper-large-v3"),
-                        language="ja",
-                        response_format="text",
-                        prompt=base_prompt,
-                        temperature=0.0
-                    )
-                    
-                    if translation and translation.strip():
-                        new_text = translation.strip()
-                        if new_text in hallucination_list:
-                            break
+            translation = client.audio.transcriptions.create(
+                file=("audio.wav", buffer),
+                model=self.config.get("stt_model", "whisper-large-v3"),
+                language="ja", response_format="text",
+                prompt=base_prompt, temperature=0.0
+            )
+            
+            text = translation.strip() if translation else ""
+            # 幻聴リスト
+            hallucinations = ["ありがとうございました", "ご視聴ありがとうございました", "視聴ありがとうございました", "Thank you"]
+            if any(h in text for h in hallucinations) and len(text) < 15:
+                text = ""
 
-                        # main_groq.pyの差分表示ロジックを採用
-                        if new_text != self.full_transcript:
-                            if new_text.startswith(self.full_transcript):
-                                diff = new_text[len(self.full_transcript):].strip()
-                            else:
-                                diff = new_text.replace(self.full_transcript, "").strip()
-                            
-                            if diff:
-                                self.full_transcript = new_text
-                                self.after(0, lambda: self.update_preview(new_text))
-                    break
-                except Exception as e:
-                    print(f"Streaming STT Attempt {attempt+1} Error: {e}")
-                    if attempt == 2:
-                        self.after(0, lambda: self.status_label.configure(text="NET ERROR", text_color="#FFFF00"))
-                    time.sleep(1)
+            if is_final:
+                if text:
+                    self.finalized_transcript += text + " "
+                self.partial_transcript = ""
+            else:
+                self.partial_transcript = text
+                
+            self.after(0, lambda: self.update_preview_ui(self.finalized_transcript + self.partial_transcript))
+            
+        except Exception as e:
+            print(f"STT Error: {e}")
 
-    def update_preview(self, text):
-        display_text = text[-40:] if len(text) > 40 else text
-        self.preview_label.configure(text=display_text, text_color=COLOR_TEXT_PRIMARY)
-        self.status_label.configure(text_color="#00FFFF")
-        self.after(200, lambda: self.status_label.configure(text_color=COLOR_RECORDING) if self.recording else None)
+    def update_preview_ui(self, text, is_initial=False):
+        self.preview_box.configure(state="normal")
+        if is_initial:
+            self.preview_box.delete("1.0", "end")
+        
+        # 確定済みと認識中の色分け
+        self.preview_box.delete("1.0", "end")
+        self.preview_box.insert("end", self.finalized_transcript, "final")
+        self.preview_box.insert("end", self.partial_transcript, "partial")
+        
+        self.preview_box.tag_config("final", foreground=COLOR_TEXT_PRIMARY)
+        self.preview_box.tag_config("partial", foreground="#00FFFF")
+        
+        self.preview_box.see("end") # 自動スクロール
+        self.preview_box.configure(state="disabled")
 
     def stop_recording(self):
         self.recording = False
         if self.stream:
-            try:
-                self.stream.stop_stream()
-                self.stream.close()
-            except: pass
-            self.stream = None
+            self.stream.stop_stream()
+            self.stream.close()
         
+        full_text = (self.finalized_transcript + self.partial_transcript).strip()
         self.status_label.configure(text="⚡ POLISHING...", text_color=COLOR_ACCENT)
-        self.preview_label.configure(text="AI is refining your speech...", text_color=COLOR_TEXT_SECONDARY)
         self.meter_bar.configure(fg_color=COLOR_ACCENT)
-        threading.Thread(target=self.finish_ai_process, daemon=True).start()
+        
+        threading.Thread(target=self.finish_ai_process, args=(full_text,), daemon=True).start()
 
-    def finish_ai_process(self):
-        time.sleep(0.5)
-        if not self.full_transcript.strip():
-            self.after(0, lambda: self.reset_ui())
+    def finish_ai_process(self, text):
+        if not text:
+            self.after(0, self.reset_ui)
             return
             
-        clean_text = process_text_with_groq(self.full_transcript, self.config)
+        clean_text = process_text_with_groq(text, self.config)
         self.clipboard_clear()
         self.clipboard_append(clean_text)
         time.sleep(0.2)
         pyautogui.hotkey('ctrl', 'v')
-        self.after(0, lambda: self.reset_ui())
+        self.after(0, self.reset_ui)
 
     def reset_ui(self):
-        self.preview_label.configure(text="Wait for command...", text_color=COLOR_TEXT_SECONDARY)
+        self.preview_box.configure(state="normal")
+        self.preview_box.delete("1.0", "end")
+        self.preview_box.insert("1.0", "Wait for command...")
+        self.preview_box.configure(state="disabled")
         self.status_label.configure(text=f"READY ({self.config['hotkey'].upper()})", text_color=COLOR_ACCENT)
-        self.meter_bar.configure(width=0, fg_color=COLOR_ACCENT)
+        self.meter_bar.configure(width=0)
 
     def show_settings(self, event):
-        # 設定ウィンドウもリデザイン
         settings_win = ctk.CTkToplevel(self)
         settings_win.title("Settings")
         settings_win.geometry("400x420")
@@ -349,13 +410,11 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         
         ctk.CTkLabel(settings_win, text="Universal Voice AI / Settings", font=("Montserrat", 16, "bold"), text_color=COLOR_ACCENT).pack(pady=20)
         
-        # API Key
         ctk.CTkLabel(settings_win, text="Groq API Key:", text_color=COLOR_TEXT_PRIMARY).pack(pady=(10, 2))
         key_entry = ctk.CTkEntry(settings_win, width=300, fg_color="#2A2A2A", border_color="#444444")
         key_entry.insert(0, self.config["api_key"])
         key_entry.pack(pady=5)
 
-        # マイク感度 (ゲイン)
         ctk.CTkLabel(settings_win, text="Microphone Sensitivity (Gain):", text_color=COLOR_TEXT_PRIMARY).pack(pady=(20, 2))
         gain_val_label = ctk.CTkLabel(settings_win, text=f"{self.config.get('mic_gain', 1.0):.1f}x", text_color=COLOR_ACCENT)
         gain_val_label.pack()
@@ -370,7 +429,6 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         )
         gain_slider.set(self.config.get("mic_gain", 1.0))
         gain_slider.pack(pady=5, padx=50, fill="x")
-        ctk.CTkLabel(settings_win, text="1.0x (Normal) - 10.0x (Boost for quiet voice)", font=("Meiryo", 8), text_color=COLOR_TEXT_SECONDARY).pack()
 
         save_btn = ctk.CTkButton(
             settings_win, text="SAVE CONFIG", 
@@ -385,11 +443,8 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         self.config["mic_gain"] = float(gain)
         save_config(self.config)
         win.destroy()
-        messagebox.showinfo("Success", "Settings updated with elegance.")
-
-    def run(self):
-        self.mainloop()
+        messagebox.showinfo("Success", "Settings updated.")
 
 if __name__ == "__main__":
     app = UniversalVoiceAI_Groq()
-    app.run()
+    app.mainloop()
