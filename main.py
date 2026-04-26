@@ -15,6 +15,9 @@ import collections
 import pystray
 from pystray import MenuItem as item
 from PIL import Image, ImageDraw
+import pygetwindow as gw # ウィンドウ制御用
+import win32gui
+import win32con
 
 # --- 設定 ---
 CONFIG_FILE = "config_groq.json"
@@ -103,8 +106,14 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         self.frame_duration_ms = 30     # 10, 20, 30ms のみ対応
         self.frame_size = int(self.sample_rate * self.frame_duration_ms / 1000) * 2 # 16bit = 2bytes
         
+        self.last_active_window = None # 録音開始時のウィンドウ保持用
+        
         self.pa = pyaudio.PyAudio()
         self.stream = None
+        
+        # STT状態管理
+        self.stt_busy = False
+        self.stt_condition = threading.Condition()
         
         # システムトレイ設定
         self.tray_icon = None
@@ -239,6 +248,14 @@ class UniversalVoiceAI_Groq(ctk.CTk):
             messagebox.showwarning("Warning", "Groq APIキーを設定してください。")
             return
 
+        # 録音開始時のアクティブウィンドウを記憶
+        try:
+            self.last_active_window = gw.getActiveWindow()
+            print(f"Active window capture: {self.last_active_window.title if self.last_active_window else 'None'}")
+        except Exception as e:
+            print(f"Window capture error: {e}")
+            self.last_active_window = None
+
         self.recording = True
         self.audio_buffer = []
         self.finalized_transcript = ""
@@ -248,6 +265,9 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         self.update_preview_ui("Listening...", is_initial=True)
         self.meter_bar.configure(fg_color=COLOR_RECORDING)
         self.update_meter()
+        
+        # STTクライアント初期化
+        self.groq_client = Groq(api_key=self.config["api_key"])
         
         try:
             self.stream = self.pa.open(
@@ -277,7 +297,7 @@ class UniversalVoiceAI_Groq(ctk.CTk):
 
     def vad_and_stt_loop(self):
         """VADで無音を検知し、APIへ送るメインループ (要件2)"""
-        client = Groq(api_key=self.config["api_key"])
+        # start_recordingで初期化したself.groq_clientを使用
         
         # VAD状態管理
         num_silent_frames = 0
@@ -305,7 +325,7 @@ class UniversalVoiceAI_Groq(ctk.CTk):
             
             # STT実行 (中間または確定)
             should_finalize = (num_silent_frames >= silence_threshold)
-            self.run_stt(client, audio_content, is_final=should_finalize)
+            self.run_stt(self.groq_client, audio_content, is_final=should_finalize)
             
             if should_finalize:
                 # 無音を検知したので、音声バッファをリセット
@@ -315,6 +335,9 @@ class UniversalVoiceAI_Groq(ctk.CTk):
 
     def run_stt(self, client, audio_data, is_final):
         """Whisper APIを呼び出し結果をUIに反映"""
+        with self.stt_condition:
+            self.stt_busy = True
+            
         buffer = io.BytesIO()
         with wave.open(buffer, 'wb') as wf:
             wf.setnchannels(1)
@@ -324,15 +347,19 @@ class UniversalVoiceAI_Groq(ctk.CTk):
         buffer.seek(0)
         
         try:
-            base_prompt = "これは日本語の音声入力です。"
+            # 直前の確定済みテキストの末尾50文字を文脈（プロンプト）として渡す (要件2)
+            context_prompt = "これは日本語の音声入力です。"
+            if self.finalized_transcript:
+                context_prompt += " 直前の文脈: " + self.finalized_transcript[-50:]
+            
             if self.config.get("mic_gain", 1.0) > 1.5:
-                base_prompt += " 小さなささやき声も正確に拾ってください。"
+                context_prompt += " 小さなささやき声も正確に拾ってください。"
 
             translation = client.audio.transcriptions.create(
                 file=("audio.wav", buffer),
                 model=self.config.get("stt_model", "whisper-large-v3"),
                 language="ja", response_format="text",
-                prompt=base_prompt, temperature=0.0
+                prompt=context_prompt, temperature=0.0
             )
             
             text = translation.strip() if translation else ""
@@ -343,7 +370,9 @@ class UniversalVoiceAI_Groq(ctk.CTk):
 
             if is_final:
                 if text:
-                    self.finalized_transcript += text + " "
+                    # その場でLLM整形して蓄積 (要件1: 逐次整形によるトークン節約)
+                    polished_chunk = process_text_with_groq(text, self.config)
+                    self.finalized_transcript += polished_chunk + " "
                 self.partial_transcript = ""
             else:
                 self.partial_transcript = text
@@ -352,6 +381,10 @@ class UniversalVoiceAI_Groq(ctk.CTk):
             
         except Exception as e:
             print(f"STT Error: {e}")
+        finally:
+            with self.stt_condition:
+                self.stt_busy = False
+                self.stt_condition.notify_all()
 
     def update_preview_ui(self, text, is_initial=False):
         self.preview_box.configure(state="normal")
@@ -371,26 +404,72 @@ class UniversalVoiceAI_Groq(ctk.CTk):
 
     def stop_recording(self):
         self.recording = False
+        
+        # デバイスを即座に停止
         if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        
-        full_text = (self.finalized_transcript + self.partial_transcript).strip()
-        self.status_label.configure(text="⚡ POLISHING...", text_color=COLOR_ACCENT)
-        self.meter_bar.configure(fg_color=COLOR_ACCENT)
-        
-        threading.Thread(target=self.finish_ai_process, args=(full_text,), daemon=True).start()
+            try:
+                self.stream.stop_stream()
+                self.stream.close()
+            except: pass
+
+        # 最後のバッファを強制的に確定
+        def finalize_and_polish():
+            # 最後のバッファを取得
+            with self.buffer_lock:
+                final_audio = b"".join(self.audio_buffer)
+                self.audio_buffer = []
+
+            # 最後の一文をリクエスト (処理が終わるまで待つ)
+            if final_audio:
+                self.run_stt(self.groq_client, final_audio, is_final=True)
+            
+            # 全てのSTT処理が終わるのを待つ
+            with self.stt_condition:
+                while self.stt_busy:
+                    self.stt_condition.wait(timeout=2.0)
+                    break # 安全のためタイムアウトで抜ける
+
+            full_text = self.finalized_transcript.strip()
+            self.after(0, lambda: self.status_label.configure(text="⚡ FINISHING...", text_color=COLOR_ACCENT))
+            self.after(0, lambda: self.meter_bar.configure(fg_color=COLOR_ACCENT))
+            
+            # すでに逐次整形されているため、ここでは貼り付け処理のみ
+            self.finish_ai_process(full_text)
+
+        threading.Thread(target=finalize_and_polish, daemon=True).start()
 
     def finish_ai_process(self, text):
         if not text:
             self.after(0, self.reset_ui)
             return
-            
-        clean_text = process_text_with_groq(text, self.config)
+
+        # 前のウィンドウへフォーカスを戻す
+        if self.last_active_window:
+            try:
+                # 最小化されていないか確認
+                if not self.last_active_window.isMinimized:
+                    self.last_active_window.activate()
+                    time.sleep(0.3) # フォーカスが移るのを待つ
+            except Exception as e:
+                print(f"Focus restoration error: {e}")
+                # フォールバック: win32guiを使用
+                try:
+                    hwnd = win32gui.FindWindow(None, self.last_active_window.title)
+                    if hwnd:
+                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                        win32gui.SetForegroundWindow(hwnd)
+                        time.sleep(0.3)
+                except: pass
+
+        # すでに各チャンクで整形済みのため、ここではクリップボードへ送るだけ
         self.clipboard_clear()
-        self.clipboard_append(clean_text)
-        time.sleep(0.2)
+        self.clipboard_append(text)
+        time.sleep(0.3) # クリップボード反映待ち
         pyautogui.hotkey('ctrl', 'v')
+        
+        # ステータス更新
+        self.after(0, lambda: self.status_label.configure(text="✔ PASTED!", text_color="#00FF00"))
+        time.sleep(1.0)
         self.after(0, self.reset_ui)
 
     def reset_ui(self):

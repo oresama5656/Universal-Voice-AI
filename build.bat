@@ -8,7 +8,7 @@ pip install -r requirements.txt
 pip install pyinstaller
 
 echo 2. Building Universal Voice AI (Groq)...
-pyinstaller --onefile --noconsole --name "Universal_Voice_AI" --clean main.py
+pyinstaller --clean Universal_Voice_AI_Groq.spec
 
 echo.
 echo ========================================

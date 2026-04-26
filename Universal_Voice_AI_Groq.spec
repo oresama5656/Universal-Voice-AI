@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import customtkinter
 
+# customtkinterのパスを取得
+ctk_path = os.path.dirname(customtkinter.__file__)
 
 a = Analysis(
-    ['main_groq.py'],
+    ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[(ctk_path, 'customtkinter')],
+    hiddenimports=['pystray', 'PIL', 'numpy', 'webrtcvad', 'pygetwindow', 'pywin32'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -22,7 +26,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='Universal_Voice_AI_Groq',
+    name='Universal_Voice_AI',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -35,4 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=None, # アイコンがあれば追加可能
 )
